@@ -6,10 +6,10 @@ from .resolvers import MutationResolver, QueryResolver
 
 
 class FileField(TextField):
-    query_resolver = QueryResolver
-    mutation_resolver = MutationResolver
+    query_resolvers = QueryResolver()
+    mutation_resolvers = MutationResolver()
     hooks = [add_upload_mutation]
 
-    def __init__(self, *args, upload_resolver=None, **kwargs):
+    def __init__(self, *args, upload_resolvers=None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.upload_resolver = upload_resolver
+        self.upload_resolvers = upload_resolvers

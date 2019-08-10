@@ -12,7 +12,8 @@ def add_upload_mutation(context):
         context.model_class.Meta.name +
         pascalcase(context.field_name)
     )
-    bp.create_mutation(mutation_name, upload_resolver, upload_type)
+    upload_resolvers = context.field.upload_resolvers or upload_resolver
+    bp.create_mutation(mutation_name, upload_resolvers, upload_type)
 
 
 def add_upload_type(blueprint):

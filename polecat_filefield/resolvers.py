@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import boto3
-from polecat.core import active_config
+from polecat.core.config import default_config
 from polecat.model.db import Q
 from polecat.utils import retry
 
@@ -10,37 +10,38 @@ from .utils import (destination_path_from_filename, remove_leading_slash,
                     temporary_path_from_file_id)
 
 
-@active_config
-def get_s3_client(config=None):
+def get_s3_client():
     return boto3.client(
         's3',
-        aws_access_key_id=config.filefield.aws_access_key_id,
-        aws_secret_access_key=config.filefield.aws_secret_access_key,
-        region_name=config.filefield.aws_default_region
+        aws_access_key_id=default_config.filefield.aws_access_key_id,
+        aws_secret_access_key=default_config.filefield.aws_secret_access_key,
+        region_name=default_config.filefield.aws_default_region
     )
 
 
 class Resolver:
     def __init__(self, expiry=None):
-        self.expiry = expiry
-        if not self.expiry:
-            with active_config() as config:
-                self.expiry = config.filefield.query_expiry
+        self._expiry = expiry
+
+    @property
+    def expiry(self):
+        if self._expiry is None:
+            self._expiry = default_config.filefield.query_expiry
+        return self._expiry
 
 
 class QueryResolver(Resolver):
-    @active_config
-    def resolve(self, model, field, field_name, config=None):
-        filename = getattr(model, field_name, None)
+    def __call__(self, context, model, field, field_name):
+        filename = model.get(field_name)
         if not filename:
             return None
         s3 = get_s3_client()
         path = destination_path_from_filename(filename)
         path = remove_leading_slash(path)
-        return s3.generate_presigned_url(
+        model[field_name] = s3.generate_presigned_url(
             'get_object',
             Params={
-                'Bucket': config.filefield.aws_bucket,
+                'Bucket': default_config.filefield.aws_bucket,
                 'Key': path
             },
             ExpiresIn=self.expiry
@@ -52,19 +53,22 @@ class MutationResolver(Resolver):
         super().__init__(expiry=expiry)
         self.prefix = prefix
 
-    @active_config
-    def resolve(self, model, field, field_name, value, config=None):
-        file_id = value
-        bucket = config.filefield.aws_bucket,
+    def __call__(self, context, model, field, field_name):
+        file_id = getattr(model, field_name)
+        bucket = default_config.filefield.aws_bucket
         tmpfile_query = (
             Q(Tmpfile)
-            .filter(uuid=file_id)
+            .filter(key=file_id)
         )
-        filename = (
-            tmpfile_query
-            .select('filename')
-            .get()
-        )['filename']
+        try:
+            filename = (
+                tmpfile_query
+                .select('filename')
+                .get()
+            )['filename']
+        except TypeError:
+            # TODO: Better error.
+            raise Exception('Invalid file ID')
         if self.prefix:
             filename = str(Path(self.prefix)/filename)
         dst_path = destination_path_from_filename(filename)
@@ -72,37 +76,48 @@ class MutationResolver(Resolver):
         tmp_path = temporary_path_from_file_id(file_id)
         tmp_path = remove_leading_slash(tmp_path)
         s3 = get_s3_client()
-        with retry():
-            s3.copy_object(
-                CopySource={
-                    'Bucket': bucket,
-                    'Key': tmp_path
-                },
-                Bucket=bucket,
-                Key=dst_path
-            )
-        with retry(swallow_error=True):
-            s3.delete_object(
-                Bucket=bucket,
-                Key=tmp_path
-            )
-            tmpfile_query.delete().execute()
-        return filename
+        self.copy_file(s3, bucket, tmp_path, dst_path)
+        self.delete_tmpfile(s3, bucket, tmp_path, tmpfile_query)
+        setattr(model, field_name, filename)
+
+    @retry
+    def copy_file(self, s3, bucket, tmp_path, dst_path):
+        s3.copy_object(
+            CopySource={
+                'Bucket': bucket,
+                'Key': tmp_path
+            },
+            Bucket=bucket,
+            Key=dst_path
+        )
+
+    @retry(swallow_error=True)
+    def delete_tmpfile(self, s3, bucket, tmp_path, tmpfile_query):
+        s3.delete_object(
+            Bucket=bucket,
+            Key=tmp_path
+        )
+        tmpfile_query.delete().execute()
 
 
-@active_config
-def upload_resolver(filename, config=None):
-    file_id = Q(Tmpfile).insert(filename=filename)
+def upload_resolver(mutation, context):
+    input = context.parse_input()
+    file_id = (
+        Q(Tmpfile)
+        .insert(filename=input['filename'])
+        .select('key')
+        .get()
+    )['key']
     tmp_path = temporary_path_from_file_id(file_id)
     tmp_path = remove_leading_slash(tmp_path)
     s3 = get_s3_client()
-    bucket = config.filefield.aws_bucket,
+    bucket = default_config.filefield.aws_bucket
     params = {
         'Bucket': bucket,
         'Key': tmp_path,
         # 'ACL': 'bucket-owner-full-control'
     }
-    expiry = config.filefield.upload_expiry
+    expiry = default_config.filefield.upload_expiry
     presigned_url = s3.generate_presigned_url(
         'put_object',
         Params=params,
